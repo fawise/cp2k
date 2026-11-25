@@ -160,6 +160,7 @@ QS/regtest-nmr-4
 QS/regtest-almo-2
 xTB/regtest-stda-force
 QS/regtest-hfx-periodic                                     libint
+QS/regtest-hfx-damping                                      libint
 ATOM/regtest-2
 xTB/regtest-tblite-gfn1-grad                                tblite spglib
 QS/regtest-ri-rpa                                           libint

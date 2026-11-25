@@ -1,0 +1,4 @@
+# runs are executed in the same order as in this file
+# H16 lattice with Fermi-Dirac smearing, PBE0-TC-LRC, Broyden mixing: does not converge without DENSITY_DAMPING
+"H16_pbe0_broyden_damping.inp" = [{matcher = "E_total", tol = 1e-6, ref = -7.673099526346151}]
+"H16_pbe0_broyden_hold.inp"    = [{matcher = "E_total", tol = 1e-6, ref = -7.673099171366522}]

@@ -33,14 +33,10 @@ MODULE hfx_admm_utils
    USE cp_blacs_env,                    ONLY: cp_blacs_env_type
    USE cp_control_types,                ONLY: admm_control_type,&
                                               dft_control_type
-   USE cp_dbcsr_api,                    ONLY: dbcsr_add,&
-                                              dbcsr_copy,&
-                                              dbcsr_create,&
-                                              dbcsr_init_p,&
-                                              dbcsr_p_type,&
-                                              dbcsr_set,&
-                                              dbcsr_type,&
-                                              dbcsr_type_no_symmetry
+   USE cp_dbcsr_api,                    ONLY: &
+        dbcsr_add, dbcsr_copy, dbcsr_create, dbcsr_init_p, dbcsr_p_type, dbcsr_release, dbcsr_set, &
+        dbcsr_type, dbcsr_type_no_symmetry
+   USE cp_dbcsr_contrib,                ONLY: dbcsr_maxabs
    USE cp_dbcsr_cp2k_link,              ONLY: cp_dbcsr_alloc_block_from_nbl
    USE cp_dbcsr_operations,             ONLY: cp_dbcsr_m_by_n_from_row_template,&
                                               dbcsr_allocate_matrix_set
@@ -136,7 +132,9 @@ MODULE hfx_admm_utils
    USE qs_rho_types,                    ONLY: qs_rho_create,&
                                               qs_rho_get,&
                                               qs_rho_type
+   USE qs_scf_types,                    ONLY: qs_scf_env_type
    USE rt_propagation_types,            ONLY: rt_prop_type
+   USE scf_control_types,               ONLY: scf_control_type
    USE task_list_methods,               ONLY: generate_qs_task_list
    USE task_list_types,                 ONLY: allocate_task_list,&
                                               deallocate_task_list
@@ -153,6 +151,17 @@ MODULE hfx_admm_utils
              tddft_hfx_matrix, hfx_ks_matrix_kp
 
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'hfx_admm_utils'
+
+   ! state of the density damping for the exact-exchange build (&HF DENSITY_DAMPING)
+   INTEGER, SAVE, PRIVATE                                       :: pmix_last_iter = -1, pmix_stall = 0, &
+                                                                   pmix_nsync = 0, pmix_last_sync = -100
+   LOGICAL, SAVE, PRIVATE                                       :: pmix_active = .FALSE., &
+                                                                   pmix_k_valid = .FALSE., pmix_reuse = .FALSE.
+   INTEGER, SAVE, PRIVATE                                       :: pmix_since_upd = 0, pmix_hold = 1
+   REAL(KIND=dp), SAVE, PRIVATE                                 :: pmix_ehfx = 0.0_dp
+   REAL(KIND=dp), SAVE, PRIVATE                                 :: pmix_lag_removed = 0.0_dp
+   REAL(KIND=dp), SAVE, PRIVATE                                 :: pmix_alpha_cur = 0.0_dp, pmix_alpha_in = -1.0_dp, &
+                                                                   pmix_res_best = HUGE(0.0_dp)
 
 CONTAINS
 
@@ -1266,6 +1275,7 @@ CONTAINS
             CALL get_qs_env(qs_env=qs_env, matrix_ks_kp=matrix_ks_orb, rho=rho_orb)
          END IF
          CALL qs_rho_get(rho_struct=rho_orb, rho_ao_kp=rho_ao_orb)
+         CALL hfx_pmix_apply(qs_env, rho_ao_orb, hfx_sections, irep, calculate_forces, just_energy)
          ! Finally the real hfx calulation
          ehfx = 0.0_dp
 
@@ -1285,12 +1295,17 @@ CONTAINS
 
          ELSE
 
-            DO ispin = 1, mspin
-               CALL integrate_four_center(qs_env, x_data, matrix_ks_orb, eh1, rho_ao_orb, hfx_sections, &
-                                          para_env, s_mstruct_changed, irep, distribute_fock_matrix, &
-                                          ispin=ispin)
-               ehfx = ehfx + eh1
-            END DO
+            CALL hfx_pmix_k_restore(qs_env, matrix_ks_orb, ehfx, n_rep_hf)
+            IF (.NOT. pmix_reuse) THEN
+               DO ispin = 1, mspin
+                  CALL integrate_four_center(qs_env, x_data, matrix_ks_orb, eh1, rho_ao_orb, hfx_sections, &
+                                             para_env, s_mstruct_changed, irep, distribute_fock_matrix, &
+                                             ispin=ispin)
+                  ehfx = ehfx + eh1
+               END DO
+               CALL hfx_pmix_k_store(qs_env, matrix_ks_orb, ehfx, n_rep_hf, &
+                                     distribute_fock_matrix .AND. dft_control%do_admm)
+            END IF
          END IF
 
          IF (calculate_forces .AND. .NOT. do_adiabatic_rescaling) THEN
@@ -2578,5 +2593,273 @@ CONTAINS
 
       CALL timestop(handle)
    END SUBROUTINE tddft_hfx_matrix
+
+! **************************************************************************************************
+!> \brief Damp the density matrix used for the exact-exchange build during the SCF:
+!>        P_hfx <- P_hfx + alpha*(P_out - P_hfx). With G-space density mixing the exchange would
+!>        otherwise see the unmixed output density matrix. The remaining lag max|P_out - P_hfx| is
+!>        stored in scf_env%hfx_pmix_lag and enters the SCF residual. alpha is halved when the
+!>        residual stalls (DENSITY_DAMPING_ADAPTIVE). Not applied for forces / energy-only calls.
+!> \param qs_env ...
+!> \param rho_ao on entry the current density matrices, on exit possibly the damped ones
+!> \param hfx_sections ...
+!> \param irep ...
+!> \param calculate_forces ...
+!> \param just_energy ...
+! **************************************************************************************************
+   SUBROUTINE hfx_pmix_apply(qs_env, rho_ao, hfx_sections, irep, calculate_forces, just_energy)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: rho_ao
+      TYPE(section_vals_type), POINTER                   :: hfx_sections
+      INTEGER, INTENT(IN)                                :: irep
+      LOGICAL, INTENT(IN)                                :: calculate_forces, just_energy
+
+      REAL(KIND=dp), PARAMETER                           :: alpha_min = 0.02_dp
+
+      INTEGER                                            :: hold, img, ispin, iter, iunit
+      LOGICAL                                            :: adaptive, do_sync, held, no_progress, &
+                                                            reinit, sync
+      REAL(KIND=dp)                                      :: alpha0, alpha_eff, lag, res
+      TYPE(cp_logger_type), POINTER                      :: logger
+      TYPE(dbcsr_type)                                   :: tmp
+      TYPE(qs_scf_env_type), POINTER                     :: scf_env
+      TYPE(scf_control_type), POINTER                    :: scf_control
+
+      pmix_reuse = .FALSE.
+      pmix_active = .FALSE.
+      IF (calculate_forces .OR. just_energy) RETURN
+      NULLIFY (scf_env)
+      CALL get_qs_env(qs_env, scf_env=scf_env)
+      IF (.NOT. ASSOCIATED(scf_env)) RETURN
+
+      CALL section_vals_val_get(hfx_sections, "DENSITY_DAMPING", r_val=alpha0, i_rep_section=irep)
+      CALL section_vals_val_get(hfx_sections, "DENSITY_DAMPING_ADAPTIVE", l_val=adaptive, i_rep_section=irep)
+      CALL section_vals_val_get(hfx_sections, "DENSITY_DAMPING_SYNC", l_val=sync, i_rep_section=irep)
+      CALL section_vals_val_get(hfx_sections, "DENSITY_DAMPING_HOLD", i_val=hold, i_rep_section=irep)
+      IF (alpha0 <= 0.0_dp .OR. alpha0 >= 1.0_dp) THEN
+         scf_env%hfx_pmix_lag = 0.0_dp
+         RETURN
+      END IF
+      hold = MAX(1, hold)
+      pmix_hold = hold
+      pmix_active = .TRUE.
+      iter = scf_env%iter_count
+
+      reinit = .NOT. ASSOCIATED(scf_env%hfx_pmix_p)
+      IF (.NOT. reinit) THEN
+         reinit = (iter <= 1) .OR. (SIZE(scf_env%hfx_pmix_p, 1) /= SIZE(rho_ao, 1)) .OR. &
+                  (SIZE(scf_env%hfx_pmix_p, 2) /= SIZE(rho_ao, 2))
+      END IF
+      IF (reinit) THEN
+         IF (ASSOCIATED(scf_env%hfx_pmix_p)) THEN
+            DO img = 1, SIZE(scf_env%hfx_pmix_p, 2)
+               DO ispin = 1, SIZE(scf_env%hfx_pmix_p, 1)
+                  CALL dbcsr_release(scf_env%hfx_pmix_p(ispin, img)%matrix)
+                  DEALLOCATE (scf_env%hfx_pmix_p(ispin, img)%matrix)
+               END DO
+            END DO
+            DEALLOCATE (scf_env%hfx_pmix_p)
+         END IF
+         ALLOCATE (scf_env%hfx_pmix_p(SIZE(rho_ao, 1), SIZE(rho_ao, 2)))
+         DO img = 1, SIZE(rho_ao, 2)
+            DO ispin = 1, SIZE(rho_ao, 1)
+               NULLIFY (scf_env%hfx_pmix_p(ispin, img)%matrix)
+               ALLOCATE (scf_env%hfx_pmix_p(ispin, img)%matrix)
+               CALL dbcsr_create(scf_env%hfx_pmix_p(ispin, img)%matrix, template=rho_ao(ispin, img)%matrix, &
+                                 name="HFX damped density matrix")
+               CALL dbcsr_copy(scf_env%hfx_pmix_p(ispin, img)%matrix, rho_ao(ispin, img)%matrix)
+            END DO
+         END DO
+         pmix_last_iter = iter
+         ! keep a damping factor learned earlier in this run (e.g. before a restart of the inner SCF loop)
+         IF (alpha0 /= pmix_alpha_in .OR. pmix_alpha_cur <= 0.0_dp .OR. pmix_alpha_cur > alpha0) THEN
+            pmix_alpha_cur = alpha0
+         END IF
+         pmix_alpha_in = alpha0
+         pmix_res_best = HUGE(0.0_dp)
+         pmix_stall = 0
+         pmix_nsync = 0
+         pmix_last_sync = -100
+         pmix_lag_removed = 0.0_dp
+         pmix_k_valid = .FALSE.
+         pmix_since_upd = 0
+         scf_env%hfx_pmix_lag = 0.0_dp
+         scf_env%hfx_pmix_res = 0.0_dp
+         RETURN
+      END IF
+
+      IF (iter /= pmix_last_iter) THEN
+         ! adaptive damping, based on the density residual without the exchange lag
+         res = scf_env%hfx_pmix_res
+         IF (adaptive .AND. iter > 3) THEN
+            IF (res < pmix_res_best) THEN
+               pmix_res_best = res
+               pmix_stall = 0
+            ELSE
+               pmix_stall = pmix_stall + 1
+            END IF
+            no_progress = (pmix_stall >= 5 .AND. res > 2.0_dp*pmix_res_best) .OR. pmix_stall >= 15
+            IF (no_progress .AND. pmix_alpha_cur > alpha_min) THEN
+               pmix_alpha_cur = MAX(alpha_min, 0.5_dp*pmix_alpha_cur)
+               pmix_res_best = res
+               pmix_stall = 0
+            END IF
+         END IF
+         ! synchronise the exchange with the density once the density itself is converged
+         do_sync = .FALSE.
+         IF (sync .AND. iter > 3) THEN
+            NULLIFY (scf_control)
+            CALL get_qs_env(qs_env, scf_control=scf_control)
+            IF (ASSOCIATED(scf_control)) THEN
+               IF (scf_env%hfx_pmix_lag > scf_control%eps_scf .AND. iter - pmix_last_sync >= 10) THEN
+                  do_sync = res < scf_control%eps_scf .AND. pmix_nsync < 30
+               END IF
+            END IF
+            IF (do_sync) pmix_lag_removed = scf_env%hfx_pmix_lag
+         END IF
+         ! hold: keep the damped matrix (and with it the exchange matrix) for hold-1 iterations
+         held = hold > 1 .AND. .NOT. do_sync .AND. pmix_since_upd < hold - 1
+         alpha_eff = 1.0_dp - (1.0_dp - pmix_alpha_cur)**hold
+         lag = 0.0_dp
+         DO img = 1, SIZE(rho_ao, 2)
+            DO ispin = 1, SIZE(rho_ao, 1)
+               IF (do_sync) THEN
+                  CALL dbcsr_copy(scf_env%hfx_pmix_p(ispin, img)%matrix, rho_ao(ispin, img)%matrix)
+               ELSE
+                  CALL dbcsr_create(tmp, template=rho_ao(ispin, img)%matrix, name="HFX lag")
+                  CALL dbcsr_copy(tmp, rho_ao(ispin, img)%matrix)
+                  CALL dbcsr_add(tmp, scf_env%hfx_pmix_p(ispin, img)%matrix, 1.0_dp, -1.0_dp)
+                  lag = MAX(lag, dbcsr_maxabs(tmp))
+                  CALL dbcsr_release(tmp)
+                  IF (.NOT. held) THEN
+                     CALL dbcsr_add(scf_env%hfx_pmix_p(ispin, img)%matrix, rho_ao(ispin, img)%matrix, &
+                                    1.0_dp - alpha_eff, alpha_eff)
+                  END IF
+               END IF
+            END DO
+         END DO
+         IF (do_sync) THEN
+            pmix_nsync = pmix_nsync + 1
+            pmix_last_sync = iter
+            pmix_res_best = HUGE(0.0_dp)
+            pmix_stall = 0
+         END IF
+         IF (held) THEN
+            pmix_since_upd = pmix_since_upd + 1
+            scf_env%hfx_pmix_lag = lag
+         ELSE
+            pmix_since_upd = 0
+            pmix_k_valid = .FALSE.
+            scf_env%hfx_pmix_lag = (1.0_dp - alpha_eff)*lag
+         END IF
+         ! the iteration of a synchronisation must not count as converged: the exchange built from
+         ! the synchronised matrix has not acted on the density yet. Keep the removed lag in the
+         ! residual once; the next iteration measures the real response.
+         IF (do_sync) scf_env%hfx_pmix_lag = pmix_lag_removed
+         pmix_last_iter = iter
+         logger => cp_get_default_logger()
+         iunit = cp_logger_get_default_io_unit(logger)
+         IF (iunit > 0) THEN
+            IF (do_sync) THEN
+               WRITE (iunit, '(T2,A,ES10.3,A,I5)') "HFX| exchange density synchronised, lag removed=", &
+                  pmix_lag_removed, "  iter", iter
+            ELSE IF (held) THEN
+               WRITE (iunit, '(T2,A,ES10.3,A,I5)') "HFX| exchange matrix reused:              lag=", &
+                  scf_env%hfx_pmix_lag, "  iter", iter
+            ELSE
+               WRITE (iunit, '(T2,A,F6.3,A,ES10.3,A,I5)') "HFX| damped exchange density: alpha=", &
+                  alpha_eff, "  lag=", scf_env%hfx_pmix_lag, "  iter", iter
+            END IF
+         END IF
+      END IF
+      rho_ao => scf_env%hfx_pmix_p
+      pmix_reuse = pmix_k_valid .AND. hold > 1
+
+   END SUBROUTINE hfx_pmix_apply
+
+! **************************************************************************************************
+!> \brief Reuse the exchange matrix of the last build if the damped density matrix is unchanged
+!>        (&HF DENSITY_DAMPING_HOLD). pmix_reuse is .TRUE. on exit only if the matrix was added.
+!> \param qs_env ...
+!> \param matrix_ks exchange part of the KS matrix (zero on entry)
+!> \param ehfx exchange energy
+!> \param n_rep_hf number of &HF sections
+! **************************************************************************************************
+   SUBROUTINE hfx_pmix_k_restore(qs_env, matrix_ks, ehfx, n_rep_hf)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: matrix_ks
+      REAL(KIND=dp), INTENT(INOUT)                       :: ehfx
+      INTEGER, INTENT(IN)                                :: n_rep_hf
+
+      INTEGER                                            :: ispin
+      TYPE(qs_scf_env_type), POINTER                     :: scf_env
+
+      IF (.NOT. pmix_reuse) RETURN
+      pmix_reuse = .FALSE.
+      IF (.NOT. pmix_k_valid .OR. n_rep_hf /= 1) RETURN
+      NULLIFY (scf_env)
+      CALL get_qs_env(qs_env, scf_env=scf_env)
+      IF (.NOT. ASSOCIATED(scf_env)) RETURN
+      IF (.NOT. ASSOCIATED(scf_env%hfx_pmix_k)) RETURN
+      IF (SIZE(scf_env%hfx_pmix_k, 1) /= SIZE(matrix_ks, 1) .OR. SIZE(matrix_ks, 2) /= 1) RETURN
+      DO ispin = 1, SIZE(matrix_ks, 1)
+         CALL dbcsr_add(matrix_ks(ispin, 1)%matrix, scf_env%hfx_pmix_k(ispin, 1)%matrix, 1.0_dp, 1.0_dp)
+      END DO
+      ehfx = pmix_ehfx
+      pmix_reuse = .TRUE.
+
+   END SUBROUTINE hfx_pmix_k_restore
+
+! **************************************************************************************************
+!> \brief Keep the exchange matrix just built for reuse (&HF DENSITY_DAMPING_HOLD)
+!> \param qs_env ...
+!> \param matrix_ks exchange part of the KS matrix
+!> \param ehfx exchange energy
+!> \param n_rep_hf number of &HF sections
+!> \param usable the matrix holds the complete exchange contribution and nothing else
+! **************************************************************************************************
+   SUBROUTINE hfx_pmix_k_store(qs_env, matrix_ks, ehfx, n_rep_hf, usable)
+      TYPE(qs_environment_type), POINTER                 :: qs_env
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER       :: matrix_ks
+      REAL(KIND=dp), INTENT(IN)                          :: ehfx
+      INTEGER, INTENT(IN)                                :: n_rep_hf
+      LOGICAL, INTENT(IN)                                :: usable
+
+      INTEGER                                            :: ispin
+      TYPE(qs_scf_env_type), POINTER                     :: scf_env
+
+      ! builds for forces or energy-only calls do not change the damped matrix: keep what is stored
+      IF (.NOT. pmix_active) RETURN
+      pmix_k_valid = .FALSE.
+      IF (pmix_hold <= 1 .OR. n_rep_hf /= 1 .OR. .NOT. usable) RETURN
+      IF (SIZE(matrix_ks, 2) /= 1) RETURN
+      NULLIFY (scf_env)
+      CALL get_qs_env(qs_env, scf_env=scf_env)
+      IF (.NOT. ASSOCIATED(scf_env)) RETURN
+      IF (ASSOCIATED(scf_env%hfx_pmix_k)) THEN
+         IF (SIZE(scf_env%hfx_pmix_k, 1) /= SIZE(matrix_ks, 1)) THEN
+            DO ispin = 1, SIZE(scf_env%hfx_pmix_k, 1)
+               CALL dbcsr_release(scf_env%hfx_pmix_k(ispin, 1)%matrix)
+               DEALLOCATE (scf_env%hfx_pmix_k(ispin, 1)%matrix)
+            END DO
+            DEALLOCATE (scf_env%hfx_pmix_k)
+         END IF
+      END IF
+      IF (.NOT. ASSOCIATED(scf_env%hfx_pmix_k)) THEN
+         ALLOCATE (scf_env%hfx_pmix_k(SIZE(matrix_ks, 1), 1))
+         DO ispin = 1, SIZE(matrix_ks, 1)
+            NULLIFY (scf_env%hfx_pmix_k(ispin, 1)%matrix)
+            ALLOCATE (scf_env%hfx_pmix_k(ispin, 1)%matrix)
+            CALL dbcsr_create(scf_env%hfx_pmix_k(ispin, 1)%matrix, template=matrix_ks(ispin, 1)%matrix, &
+                              name="HFX exchange matrix kept for reuse")
+         END DO
+      END IF
+      DO ispin = 1, SIZE(matrix_ks, 1)
+         CALL dbcsr_copy(scf_env%hfx_pmix_k(ispin, 1)%matrix, matrix_ks(ispin, 1)%matrix)
+      END DO
+      pmix_ehfx = ehfx
+      pmix_k_valid = .TRUE.
+
+   END SUBROUTINE hfx_pmix_k_store
 
 END MODULE hfx_admm_utils

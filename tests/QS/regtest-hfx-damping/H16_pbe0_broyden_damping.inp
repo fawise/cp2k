@@ -1,0 +1,90 @@
+&GLOBAL
+  PRINT_LEVEL LOW
+  PROJECT H16_pbe0_broyden_damping
+  RUN_TYPE ENERGY
+&END GLOBAL
+
+&FORCE_EVAL
+  METHOD Quickstep
+  &DFT
+    BASIS_SET_FILE_NAME GTH_BASIS_SETS
+    POTENTIAL_FILE_NAME POTENTIAL
+    &MGRID
+      CUTOFF 150
+      REL_CUTOFF 40
+    &END MGRID
+    &QS
+      EPS_DEFAULT 1.0E-10
+    &END QS
+    &SCF
+      ADDED_MOS 30
+      EPS_SCF 1.0E-6
+      MAX_SCF 150
+      SCF_GUESS ATOMIC
+      &DIAGONALIZATION
+        ALGORITHM STANDARD
+      &END DIAGONALIZATION
+      &MIXING
+        ALPHA 0.2
+        METHOD BROYDEN_MIXING
+        NBUFFER 5
+      &END MIXING
+      &SMEAR ON
+        ELECTRONIC_TEMPERATURE [K] 5000
+        METHOD FERMI_DIRAC
+      &END SMEAR
+    &END SCF
+    &XC
+      &HF
+        DENSITY_DAMPING 0.3
+        FRACTION 0.25
+        &INTERACTION_POTENTIAL
+          CUTOFF_RADIUS 2.9
+          POTENTIAL_TYPE TRUNCATED
+          T_C_G_DATA t_c_g.dat
+        &END INTERACTION_POTENTIAL
+        &SCREENING
+          EPS_SCHWARZ 1.0E-6
+        &END SCREENING
+      &END HF
+      &XC_FUNCTIONAL
+        &PBE
+          SCALE_C 1.0
+          SCALE_X 0.75
+        &END PBE
+        &PBE_HOLE_T_C_LR
+          CUTOFF_RADIUS 2.9
+          SCALE_X 0.25
+        &END PBE_HOLE_T_C_LR
+      &END XC_FUNCTIONAL
+    &END XC
+  &END DFT
+  &SUBSYS
+    &CELL
+      ABC 10.000 10.000 8.0
+      PERIODIC XYZ
+    &END CELL
+    &COORD
+      H   0.000  0.000  3.950
+      H   0.070  2.500  3.950
+      H   0.000  5.000  3.950
+      H   0.070  7.500  3.950
+      H   2.570  0.000  4.050
+      H   2.500  2.500  4.050
+      H   2.570  5.000  4.050
+      H   2.500  7.500  4.050
+      H   5.000  0.000  3.950
+      H   5.070  2.500  3.950
+      H   5.000  5.000  3.950
+      H   5.070  7.500  3.950
+      H   7.570  0.000  4.050
+      H   7.500  2.500  4.050
+      H   7.570  5.000  4.050
+      H   7.500  7.500  4.050
+    &END COORD
+    &KIND H
+      BASIS_SET DZVP-GTH
+      POTENTIAL GTH-PBE-q1
+    &END KIND
+  &END SUBSYS
+&END FORCE_EVAL

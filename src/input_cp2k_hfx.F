@@ -79,6 +79,40 @@ CONTAINS
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
+      CALL keyword_create(keyword, __LOCATION__, name="DENSITY_DAMPING", &
+                          description="Damping of the density matrix used for the exact-exchange build during "// &
+                          "the SCF: P_hfx <- P_hfx + alpha*(P_out - P_hfx), with alpha the value given here. "// &
+                          "With G-space density mixing (BROYDEN, PULAY, KERKER) the exchange is otherwise built "// &
+                          "from the unmixed density matrix, which prevents convergence for metallic systems "// &
+                          "with fractional occupations. 0 switches the damping off. The remaining lag enters "// &
+                          "the SCF convergence criterion.", &
+                          usage="DENSITY_DAMPING 0.2", default_r_val=0.0_dp)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="DENSITY_DAMPING_SYNC", &
+                          description="Set the damped density matrix to the current one as soon as the density "// &
+                          "residual alone is below EPS_SCF, so that the SCF does not wait for the exchange lag "// &
+                          "to decay.", &
+                          usage="DENSITY_DAMPING_SYNC F", default_l_val=.TRUE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="DENSITY_DAMPING_HOLD", &
+                          description="Update the damped density matrix only every n-th SCF iteration and "// &
+                          "reuse the exchange matrix in between (no four-centre contraction in these "// &
+                          "iterations). 1 updates in every iteration.", &
+                          usage="DENSITY_DAMPING_HOLD 4", default_i_val=1)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="DENSITY_DAMPING_ADAPTIVE", &
+                          description="Halve the DENSITY_DAMPING factor (down to 0.02) whenever the density residual "// &
+                          "has not improved for several iterations.", &
+                          usage="DENSITY_DAMPING_ADAPTIVE T", default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
       CALL keyword_create(keyword, __LOCATION__, name="TREAT_LSD_IN_CORE", &
                           description="Determines how spin densities are taken into account. "// &
                           "If true, the beta spin density is included via a second in core call. "// &

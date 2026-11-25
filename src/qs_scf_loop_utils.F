@@ -3485,6 +3485,9 @@ CONTAINS
          ! Compute the difference p_out-p_in
          CALL self_consistency_check(rho_ao_kp, scf_env%p_delta, para_env, scf_env%p_mix_new, &
                                      delta=scf_env%iter_delta)
+         ! exact exchange built from a damped density matrix: its lag is part of the residual
+         scf_env%hfx_pmix_res = scf_env%iter_delta
+         IF (scf_env%hfx_pmix_lag > 0.0_dp) scf_env%iter_delta = MAX(scf_env%iter_delta, scf_env%hfx_pmix_lag)
       CASE (no_mixing_nr)
       CASE DEFAULT
          CALL cp_abort(__LOCATION__, &

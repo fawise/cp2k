@@ -121,6 +121,8 @@ MODULE qs_scf_types
       TYPE(qs_outer_scf_type) :: outer_scf = qs_outer_scf_type()
       INTEGER :: iter_count = -1
       INTEGER :: cholesky_method = -1, nelectron = -1, method = -1, mixing_method = -1, nskip_mixing = -1
+      TYPE(dbcsr_p_type), DIMENSION(:, :), POINTER :: hfx_pmix_p => NULL(), hfx_pmix_k => NULL()
+      REAL(KIND=dp) :: hfx_pmix_lag = 0.0_dp, hfx_pmix_res = 0.0_dp
       REAL(KIND=dp) :: iter_param = -1.0_dp, iter_delta = -1.0_dp, p_mix_alpha = -1.0_dp, sum_zeff_corr = -1.0_dp
       ! ADIIS diagnostics: accepted-step norm and raw-map delta.
       REAL(KIND=dp) :: step_norm = -1.0_dp, raw_map_delta = -1.0_dp
@@ -273,6 +275,12 @@ CONTAINS
       IF (ASSOCIATED(scf_env%p_mix_new)) THEN
          CALL dbcsr_deallocate_matrix_set(scf_env%p_mix_new)
       END IF
+      IF (ASSOCIATED(scf_env%hfx_pmix_p)) THEN
+         CALL dbcsr_deallocate_matrix_set(scf_env%hfx_pmix_p)
+      END IF
+      IF (ASSOCIATED(scf_env%hfx_pmix_k)) THEN
+         CALL dbcsr_deallocate_matrix_set(scf_env%hfx_pmix_k)
+      END IF
       IF (ASSOCIATED(scf_env%p_delta)) THEN
          CALL dbcsr_deallocate_matrix_set(scf_env%p_delta)
       END IF
@@ -364,6 +372,12 @@ CONTAINS
       IF (ASSOCIATED(scf_env%p_mix_new)) THEN
          ! we should not end up here, and give back using the pools
          CALL dbcsr_deallocate_matrix_set(scf_env%p_mix_new)
+      END IF
+      IF (ASSOCIATED(scf_env%hfx_pmix_p)) THEN
+         CALL dbcsr_deallocate_matrix_set(scf_env%hfx_pmix_p)
+      END IF
+      IF (ASSOCIATED(scf_env%hfx_pmix_k)) THEN
+         CALL dbcsr_deallocate_matrix_set(scf_env%hfx_pmix_k)
       END IF
       IF (ASSOCIATED(scf_env%p_delta)) THEN
          ! we should not end up here, and give back using the pools
